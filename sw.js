@@ -1,6 +1,6 @@
 // Offline-first service worker: the app shell comes from the cache (instant open, works offline)
 // and refreshes in the background. Bump VERSION when you change files so phones pick up the update.
-const VERSION = 'horizon-v2';
+const VERSION = 'horizon-v3';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'config.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/badge-96.png'];
 
