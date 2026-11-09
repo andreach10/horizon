@@ -52,6 +52,19 @@ let tasks = load(STORE, []);
 if (!Array.isArray(tasks)) tasks = [];
 const save = () => store(STORE, tasks);
 
+// Repeating tasks are real copies, one per day, so each day keeps its own done/checklist and the tracker needs no special case.
+// ponytail: copies only exist up to the end of the visible range (4 weeks); fillSeries() tops them up every time the app opens.
+const SERIES = 'horizon-series-v1';
+let series = load(SERIES, []);
+if (!Array.isArray(series)) series = [];
+const RULES = { none: 'Once', daily: 'Every day', weekdays: 'Weekdays', weekly: 'Every week' };
+const RRULE = { daily: 'RRULE:FREQ=DAILY', weekdays: 'RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR', weekly: 'RRULE:FREQ=WEEKLY' };
+const ruleHits = (rule, from, d) => d >= parse(from) && (rule === 'daily' || (rule === 'weekdays' && d.getDay() % 6 !== 0) || (rule === 'weekly' && d.getDay() === parse(from).getDay()));
+const seriesOf = t => t && t.series && series.find(s => s.id === t.series);
+const freshSteps = st => (st || []).map(x => ({ t: x.t, done: false }));
+// Progress units: a task with a checklist counts each step; otherwise the task counts once.
+const units = t => t.steps && t.steps.length ? [t.steps.filter(s => s.done).length, t.steps.length] : [t.done ? 1 : 0, 1];
+
 // Google Calendar events (read-only here; "done" is remembered locally per event+day)
 let gEvents = [], gAllDay = {};
 const gdone = load('horizon-gdone', {});
@@ -59,6 +72,19 @@ const allTasks = () => tasks.concat(gEvents);
 const findTask = id => allTasks().find(t => t.id === id);
 // One timeline = one thing at a time: returns what overlaps `d` on its day, if anything.
 const clash = (d, ignoreId) => allTasks().find(o => o.id !== ignoreId && o.date && o.date === d.date && o.start < endOf(d) && d.start < endOf(o));
+function fillSeries(s) { // returns how many days were skipped because something else was already there
+  let skipped = 0;
+  for (let i = Math.max(0, dayIdx(s.from)); i < NDAYS; i++) {
+    const d = addDays(start, i), k = key(d);
+    if (!ruleHits(s.rule, s.from, d) || s.made.includes(k)) continue;
+    s.made.push(k); // remembered, so a deleted day never comes back
+    const t = Object.assign({}, s.tpl, { id: uid(), date: k, done: false, series: s.id, steps: freshSteps(s.tpl.steps) });
+    const o = clash(t);
+    if (o && !(o.gid && o.gid === t.gid)) { skipped++; continue; } // its own Google copy isn't a clash
+    tasks.push(t);
+  }
+  return skipped;
+}
 
 // ---------- state ----------
 let focus = C.daysBack, sel = null, editing = null, toastTimer;
@@ -88,7 +114,7 @@ function renderTrack() {
       + ` style="left:${x}px;top:${capY}px;width:${lw}px;--c:var(--c${t.color})"`
       + ` aria-label="${esc(t.title)}, ${fmtT(t.start)}${t.done ? ', done' : ''}">`
       + `<span class="cap" style="width:${w}px">${t.done ? CHECK : svg(t.icon)}</span>`
-      + `<span class="t-time">${fmtT(t.start)}${t.dur ? ' – ' + fmtT(t.start + t.dur) : ''}</span>`
+      + `<span class="t-time">${fmtT(t.start)}${t.dur ? ' – ' + fmtT(t.start + t.dur) : ''}${t.steps && t.steps.length ? ` · ${units(t).join('/')}` : ''}</span>`
       + `<span class="t-title">${esc(t.title)}</span></button>`;
     if (next && next.date === t.date) {
       const gap = next.start - (t.start + t.dur), a = x + w, b = xOf(next);
@@ -145,7 +171,7 @@ function renderTracker() {
   const by = {};
   tasks.forEach(t => {
     if (!t.date || (habit && norm(t.title) !== habit)) return;
-    const b = by[t.date] = by[t.date] || [0, 0]; b[1]++; if (t.done) b[0]++;
+    const b = by[t.date] = by[t.date] || [0, 0], [ud, ut] = units(t); b[0] += ud; b[1] += ut;
   });
   const mon = d => addDays(d, -((d.getDay() + 6) % 7));
   const first = mon(start), weekStart = mon(today), weeks = Math.round((weekStart - first) / 864e5 / 7) + 1;
@@ -192,7 +218,8 @@ function renderTracker() {
       + `<button type="button" class="hc-close" data-close aria-label="Close day breakdown">×</button></div>`
       + (items.length ? `<ul>${items.map(t => `<li class="${t.done ? 'ok' : past ? 'miss' : ''}">`
         + `<span class="hc-mark" style="--c:var(--c${t.color})">${t.done ? CHECK : past ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" aria-hidden="true"><path d="M7 7l10 10M17 7 7 17"/></svg>' : ''}</span>`
-        + `<span class="hc-t">${esc(t.title)}</span><span class="hc-time">${fmtT(t.start)}</span></li>`).join('')}</ul>` : '')
+        + `<span class="hc-t">${esc(t.title)}</span><span class="hc-time">${t.steps && t.steps.length ? units(t).join('/') + ' · ' : ''}${fmtT(t.start)}</span></li>`
+        + (t.steps && t.steps.length ? `<li class="hc-steps"><ul>${t.steps.map(s => `<li class="${s.done ? 'ok' : past ? 'miss' : ''}"><span class="hc-mark sm" style="--c:var(--c${t.color})">${s.done ? CHECK : past ? '×' : ''}</span><span class="hc-t">${esc(s.t)}</span></li>`).join('')}</ul></li>` : '')).join('')}</ul>` : '')
       + `</div>`);
     el.querySelector(`.hc[data-key="${hcDay}"]`)?.classList.add('picked');
   }
@@ -221,15 +248,17 @@ function renderDetail() {
   const [t, auto] = current(), el = $('#detail');
   el.hidden = !t; // nothing to show → the habit tracker gets the space
   if (!t) return;
-  el.innerHTML = `<div class="d-eyebrow">${auto ? 'Up next' : t.done ? 'Completed' : 'Selected'}${t.gcal ? ' · From Google Calendar' : t.synced ? ' · Also in Google Calendar' : ''}</div>`
+  const sr = seriesOf(t);
+  el.innerHTML = `<div class="d-eyebrow">${auto ? 'Up next' : t.done ? 'Completed' : 'Selected'}${sr ? ` · Repeats ${RULES[sr.rule].toLowerCase()}` : ''}${t.gcal ? ' · From Google Calendar' : t.synced ? ' · Also in Google Calendar' : ''}</div>`
     + `<div class="d-head"><span class="d-ico" style="--c:var(--c${t.color})">${svg(t.icon)}</span>`
     + `<div class="d-main"><div class="d-time">${dayName(parse(t.date), { weekday: 'short', day: 'numeric' })} · ${fmtT(t.start)}${t.dur ? ' – ' + fmtT(t.start + t.dur) + ' · ' + fmtDur(t.dur) : ''}</div><h3>${esc(t.title)}</h3>`
     + `<div class="d-rem${remindOf(t) < 0 ? ' off' : ''}">${BELL}${remindLabel(remindOf(t))}</div></div>`
     + `<button type="button" class="d-check${t.done ? ' on' : ''}" data-act="done" aria-pressed="${t.done}" aria-label="Mark ${t.done ? 'not done' : 'done'}" style="--c:var(--c${t.color})">${CHECK}</button></div>`
+    + (t.steps && t.steps.length ? `<ul class="d-steps">${t.steps.map((s, i) => `<li><button type="button" data-step="${i}" aria-pressed="${s.done}" style="--c:var(--c${t.color})"><span class="st-box">${s.done ? CHECK : ''}</span><span>${esc(s.t)}</span></button></li>`).join('')}</ul>` : '')
     + (t.notes ? `<p class="d-notes">${esc(t.notes)}</p>` : '')
     + (t.gcal
       ? `<div class="d-actions">${t.link ? `<a href="${esc(t.link)}" target="_blank" rel="noopener">Open in Google Calendar</a>` : ''}</div>`
-      : `<div class="d-actions"><button type="button" data-act="edit">Edit</button><button type="button" data-act="inbox">Move to Inbox</button><button type="button" data-act="delete" class="danger">Delete</button></div>`);
+      : `<div class="d-actions"><button type="button" data-act="edit">Edit</button><button type="button" data-act="inbox">Move to Inbox</button>${sr ? '<button type="button" data-act="stop">Stop repeating</button>' : ''}<button type="button" data-act="delete" class="danger">Delete</button></div>`);
   el.dataset.id = t.id;
 }
 
@@ -299,11 +328,23 @@ track.addEventListener('click', e => {
 });
 
 $('#detail').addEventListener('click', e => {
-  const act = e.target.closest('[data-act]')?.dataset.act; if (!act) return;
   const id = $('#detail').dataset.id, t = findTask(id); if (!t) return;
+  const st = e.target.closest('[data-step]');
+  if (st) { // checklist step: the task is done once every step is
+    const s = t.steps[+st.dataset.step]; s.done = !s.done; t.done = t.steps.every(x => x.done); sel = t.id;
+    save(); renderAll(); return;
+  }
+  const act = e.target.closest('[data-act]')?.dataset.act; if (!act) return;
   if (act === 'done') {
     t.done = !t.done; sel = t.id;
+    if (t.steps) t.steps.forEach(s => { s.done = t.done; });
     if (t.gcal) { gdone[t.gid + t.date] = t.done; store('horizon-gdone', gdone); }
+  }
+  if (act === 'stop') {
+    // Keeps today and the past (they're your history); drops upcoming copies that aren't done yet.
+    const sid = t.series, gone = tasks.filter(x => x.series === sid && x.id !== t.id && x.date > TODAY && !x.done);
+    tasks = tasks.filter(x => !gone.includes(x)); series = series.filter(s => s.id !== sid); store(SERIES, series);
+    toast(`Stopped repeating “${t.title}”${t.synced ? '. Stop it in Google Calendar too' : ''}`);
   }
   if (act === 'edit') return openSheet(t);
   const i = tasks.indexOf(t);
@@ -322,7 +363,22 @@ function showTab(name) {
   document.querySelectorAll('[data-tab]').forEach(b => { b.classList.toggle('on', b.dataset.tab === name); b.setAttribute('aria-current', b.dataset.tab === name ? 'page' : 'false'); });
   document.querySelectorAll('[data-view]').forEach(v => { v.hidden = v.dataset.view !== name; });
   if (name === 'timeline') markFocus(true);
+  syncGuard();
 }
+
+// Android back button closes the sheet / leaves Inbox instead of exiting the app:
+// one extra history entry exists while anything sits on top of the timeline.
+let guard = false;
+function syncGuard() {
+  const atRoot = $('#sheetWrap').hidden && $('[data-view="inbox"]').hidden;
+  if (!atRoot && !guard) { history.pushState({ guard: 1 }, ''); guard = true; }
+  else if (atRoot && guard) { guard = false; history.back(); } // closed with a button: drop the entry (its popstate is ignored below)
+}
+addEventListener('popstate', () => {
+  if (!guard) return;
+  guard = false;
+  if (!$('#sheetWrap').hidden) closeSheet(); else showTab('timeline');
+});
 
 // ---------- create / edit sheet ----------
 const nextSlot = () => Math.min(1425, Math.ceil((nowMin() + 1) / 30) * 30);
@@ -330,6 +386,18 @@ $('#f-icons').innerHTML = Object.keys(ICONS).map(k => `<label title="${k}"><inpu
 $('#f-colors').innerHTML = [0, 1, 2, 3, 4, 5].map(c => `<label><input type="radio" name="color" value="${c}" aria-label="Color ${c + 1}"><span class="pk-sw" style="--c:var(--c${c})"></span></label>`).join('');
 $('#f-durs').innerHTML = DURS.map(d => `<label><input type="radio" name="dur" value="${d}"><span class="pk-chip">${d ? fmtDur(d) : 'None'}</span></label>`).join('');
 $('#f-reminds').innerHTML = REMINDS.map(r => `<label><input type="radio" name="remind" value="${r}"><span class="pk-chip">${r < 0 ? 'No' : r === 0 ? 'At start' : r + ' min'}</span></label>`).join('');
+$('#f-repeats').innerHTML = Object.entries(RULES).map(([k, l]) => `<label><input type="radio" name="repeat" value="${k}"><span class="pk-chip">${l}</span></label>`).join('');
+let formSteps = [];
+function renderSteps() {
+  $('#f-steps').innerHTML = formSteps.map((s, i) => `<li><span>${esc(s.t)}</span><button type="button" data-rm="${i}" aria-label="Remove ${esc(s.t)}">×</button></li>`).join('');
+}
+function addStep() {
+  const v = $('#f-step').value.trim(); if (!v) return;
+  formSteps.push({ t: v, done: false }); $('#f-step').value = ''; renderSteps(); $('#f-step').focus();
+}
+$('#f-step-add').addEventListener('click', addStep);
+$('#f-step').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addStep(); } }); // Enter adds a step, never submits
+$('#f-steps').addEventListener('click', e => { const b = e.target.closest('[data-rm]'); if (b) { formSteps.splice(+b.dataset.rm, 1); renderSteps(); } });
 $('#f-date').min = key(start); $('#f-date').max = key(addDays(start, NDAYS - 1));
 
 function openSheet(t, preset = {}) {
@@ -344,21 +412,31 @@ function openSheet(t, preset = {}) {
   form.elements.color.value = String(v.color);
   form.elements.dur.value = String(DURS.includes(v.dur) ? v.dur : 30);
   form.elements.remind.value = String(REMINDS.includes(remindOf(v)) ? remindOf(v) : 5);
+  form.elements.repeat.value = 'none';
+  formSteps = (v.steps || []).map(s => Object.assign({}, s)); renderSteps();
   $('#f-warn').hidden = true;
   $('#f-gcal-wrap').hidden = !gClient || !!(t && t.date); // only for new or inbox tasks
+  $('#f-ghint').hidden = $('#f-gcal-wrap').hidden;
+  $('#f-repeat-wrap').hidden = !!(t && t.date); // editing changes just that day
   $('#sheetTitle').textContent = t ? (t.date ? 'Edit task' : 'Schedule task') : 'New task';
   $('#f-save').textContent = t && t.date ? 'Save changes' : 'Add to timeline';
   $('#sheetWrap').hidden = false;
+  syncGuard();
   setTimeout(() => $('#f-title').focus(), 60);
 }
-const closeSheet = () => { $('#sheetWrap').hidden = true; editing = null; };
+const closeSheet = () => { $('#sheetWrap').hidden = true; editing = null; syncGuard(); };
 
 async function commit(scheduled) {
   const title = $('#f-title').value.trim();
   if (!title) { toast('Give the task a name first'); $('#f-title').focus(); return; }
   const [hh, mm] = ($('#f-time').value || '09:00').split(':').map(Number);
   const data = { title, icon: form.elements.icon.value || 'work', color: +form.elements.color.value || 0, dur: +form.elements.dur.value,
-    remind: +form.elements.remind.value, notes: $('#f-notes').value.trim(), start: hh * 60 + mm, date: scheduled ? ($('#f-date').value || focusKey()) : null };
+    remind: +form.elements.remind.value, notes: $('#f-notes').value.trim(), start: hh * 60 + mm, date: scheduled ? ($('#f-date').value || focusKey()) : null,
+    steps: formSteps.map(s => Object.assign({}, s)) };
+  if ($('#f-step').value.trim()) data.steps.push({ t: $('#f-step').value.trim(), done: false }); // typed but didn't tap Add
+  if (!data.steps.length) delete data.steps;
+  const rule = scheduled && !$('#f-repeat-wrap').hidden ? form.elements.repeat.value || 'none' : 'none';
+  if (rule === 'weekdays') { let d = parse(data.date); while (d.getDay() % 6 === 0) d = addDays(d, 1); data.date = key(d); } // start on a weekday
   if (scheduled && !inRange(data)) { toast('Pick a day within the next four weeks'); return; }
   const c = scheduled && clash(data, editing);
   if (c) {
@@ -373,29 +451,25 @@ async function commit(scheduled) {
     return;
   }
   const toGoogle = scheduled && gClient && !$('#f-gcal-wrap').hidden && $('#f-gcal').checked;
-  let t = tasks.find(x => x.id === editing);
+  let t = tasks.find(x => x.id === editing), gErr = null;
   if (toGoogle) {
     closeSheet(); toast('Adding to Google Calendar…');
-    try {
-      const gid = await addToGoogle(data);
-      // It stays an app task (so it counts in the habit tracker); its Google copy is hidden from the line to avoid a duplicate.
-      const fields = Object.assign({}, data, { synced: true, gid });
-      if (t) Object.assign(t, fields); else { t = Object.assign({ id: uid(), done: false }, fields); tasks.push(t); }
-      sel = t.id; save(); renderAll(); goTo(dayIdx(data.date), data.start);
-      toast(`Added to Google Calendar for ${dayName(parse(data.date), { weekday: 'short', day: 'numeric' })} at ${fmtT(data.start)}`);
-    } catch (err) {
-      // Keep the task here so nothing is lost; a write is never retried automatically.
-      if (t) Object.assign(t, data); else tasks.push(Object.assign({ id: uid(), done: false }, data));
-      save(); renderAll();
-      toast(gWriteMsg(err));
-    }
-    return;
+    // It stays an app task (so it counts in the habit tracker); its Google copy is hidden from the line to avoid a duplicate.
+    // On failure the task is kept here so nothing is lost; a write is never retried automatically.
+    try { Object.assign(data, { synced: true, gid: await addToGoogle(data, rule) }); } catch (err) { gErr = err; }
   }
   if (t) Object.assign(t, data); else { t = Object.assign({ id: uid(), done: false }, data); tasks.push(t); }
+  if (t.steps) t.done = t.steps.every(s => s.done);
+  let skipped = 0;
+  if (rule !== 'none') {
+    const s = { id: uid(), rule, from: data.date, made: [data.date], tpl: Object.assign({}, data, { date: null }) };
+    t.series = s.id; series.push(s); skipped = fillSeries(s); store(SERIES, series);
+  }
   save(); closeSheet();
   if (scheduled) {
     sel = t.id; showTab('timeline'); renderAll(); goTo(dayIdx(t.date), t.start);
-    toast(`Planned for ${dayName(parse(t.date), { weekday: 'short', month: 'short', day: 'numeric' })} at ${fmtT(t.start)}`);
+    toast(gErr ? gWriteMsg(gErr) : `${t.synced ? 'Added to Google Calendar' : 'Planned'} for ${dayName(parse(t.date), { weekday: 'short', month: 'short', day: 'numeric' })} at ${fmtT(t.start)}`
+      + (rule !== 'none' ? ` · repeats ${RULES[rule].toLowerCase()}` : '') + (skipped ? ` · skipped ${skipped} day${skipped > 1 ? 's' : ''} already taken` : ''));
   } else { if (sel === t.id) sel = null; renderAll(); toast('Saved to Inbox'); }
 }
 form.addEventListener('submit', e => { e.preventDefault(); commit(true); });
@@ -434,7 +508,7 @@ function readEvents(payload) {
     if (isNaN(sd)) continue;
     const date = key(sd), st = sd.getHours() * 60 + sd.getMinutes();
     // Skip events this app created: the app task already shows them (match by id, or by title+time if no id came back).
-    if (tasks.some(t => t.synced && (t.gid === ev.id || (!t.gid && t.date === date && t.start === st && t.title === title)))) continue;
+    if (tasks.some(t => t.synced && (t.gid === ev.id || (t.gid && t.gid === ev.recurringEventId) || (!t.gid && t.date === date && t.start === st && t.title === title)))) continue;
     gEvents.push({ id: 'g:' + ev.id, gid: ev.id, gcal: true, date, start: st, dur: Math.max(0, Math.min(1440 - st, Math.round((ed - sd) / 6e4))),
       title, icon: 'gcal', color: 3, link: ev.htmlLink, notes: String(ev.description || '').replace(/<[^>]*>/g, ' ').slice(0, 240),
       done: !!gdone[ev.id + date] });
@@ -491,13 +565,14 @@ function gWriteMsg(err) {
   if (err && (err.type || err.error)) return 'Google sign-in was closed. Saved it here only.';
   return 'Couldn’t add it to Google Calendar. Saved it here only.';
 }
-async function addToGoogle(d) {
+async function addToGoogle(d, rule) {
   const sd = new Date(parse(d.date).getTime()); sd.setMinutes(d.start);
   const ed = new Date(sd.getTime()); ed.setMinutes(ed.getMinutes() + Math.max(d.dur, 15));
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const body = { summary: d.title, start: { dateTime: sd.toISOString(), timeZone: tz }, end: { dateTime: ed.toISOString(), timeZone: tz },
     reminders: d.remind >= 0 ? { useDefault: false, overrides: [{ method: 'popup', minutes: d.remind }] } : { useDefault: false } };
   if (d.notes) body.description = d.notes;
+  if (RRULE[rule]) body.recurrence = [RRULE[rule]];
   const ev = await gFetch('', { method: 'POST', body: JSON.stringify(body) }, true);
   gSync(false);
   return ev.id || null;
@@ -545,6 +620,7 @@ function handleAct(act, id) {
   const t = findTask(id); if (!t) return;
   if (act === 'done') {
     t.done = true;
+    if (t.steps) t.steps.forEach(s => { s.done = true; });
     if (t.gcal) { gdone[t.gid + t.date] = true; store('horizon-gdone', gdone); } else save();
     renderAll(); toast(`Marked “${t.title}” done`);
   } else if (act === 'snooze') { snoozed[t.id + '@' + t.start] = nowMin() + 5; toast('Snoozed for 5 minutes'); }
@@ -597,6 +673,7 @@ function checkReminders() {
 setInterval(checkReminders, 15000);
 
 // ---------- boot ----------
+if (series.length) { series.forEach(fillSeries); store(SERIES, series); save(); } // top up repeating tasks as days go by
 renderAll(); renderNotifBtn();
 const qp = new URLSearchParams(location.search), act = qp.get('act'); // set when a notification button opened the app
 if (act) history.replaceState(null, '', location.pathname);
